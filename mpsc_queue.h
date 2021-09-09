@@ -23,7 +23,13 @@ SOFTWARE.
 */
 
 #pragma once
+
+#include <atomic>
+#include <cstdint>
 #include <deque>
+#ifdef CPP23
+#include <stdatomic.h>   for C++ 23
+#endif
 
 template<class EntryData>
 class MPSCQueue
@@ -71,9 +77,14 @@ public:
     void Push2(Entry* entry) {
         Entry* tail = pending_tail;
         while(true) {
+#ifndef CPP23            
             Entry* cur_tail = __sync_val_compare_and_swap(&pending_tail, tail, entry);
-            if(__builtin_expect(cur_tail == tail, 1)) break;
+            if(cur_tail == tail) [[likely]] break;
             tail = cur_tail;
+#else
+            if (std::atomic_compare_exchange_weak(&pending_tail, tail, entry)) [[likely]]
+                break;
+#endif            
         }
         tail->next = entry;
     }
@@ -84,8 +95,15 @@ public:
     // contention winner will set pending_tail's next to the new entry and pending_tail to the new entry
     void Push3(Entry* entry) {
         entry->next = (Entry*)PendingLock;
-        while(__builtin_expect(!__sync_bool_compare_and_swap(&pending_tail->next, PendingLock, entry), 0))
-            ;
+#ifndef CPP23            
+        while(!__sync_bool_compare_and_swap(&pending_tail->next, PendingLock, entry)) [[unlikely]];
+#else
+        Entry* tmp = (Entry*)PendingLock;
+        while (!std::atomic_compare_exchange_weak(&pending_tail->next, tmp, entry)) [[unlikely]]
+        {
+            tmp = (Entry*)PendingLock;
+        }
+#endif        
         pending_tail = entry;
     }
 
@@ -112,10 +130,16 @@ private:
     static T FetchAndLock(volatile T& var, T lock_val) {
         T val = var;
         while(true) {
-            while(__builtin_expect(val == lock_val, 0)) val = var;
+            while(val == lock_val) [[unlikely]] val = var;
+#ifndef CPP23
             T new_val = __sync_val_compare_and_swap(&var, val, lock_val);
-            if(__builtin_expect(new_val == val, 1)) break;
+            if(new_val == val) [[likely]] break;
             val = new_val;
+#else
+            while(val == lock_val) [[unlikely]] val = var;
+            if (atomic_compare_exchange_weak(&var, val, lock_val)) [[likely]]
+                break;
+#endif           
         }
         return val;
     }
@@ -123,7 +147,7 @@ private:
     Entry* _Alloc() {
         if(entry_cnt >= max_entry) return nullptr;
         int cnt = FetchAndLock(entry_cnt, -1);
-        if(__builtin_expect(cnt >= max_entry, 0)) {
+        if(cnt >= max_entry) [[unlikely]] {
             entry_cnt = cnt;
             return nullptr;
         }
